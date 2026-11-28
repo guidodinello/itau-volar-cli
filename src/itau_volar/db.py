@@ -18,6 +18,10 @@ DEFAULT_DB_PATH = Path.home() / ".local" / "share" / "itau-volar" / "volar.db"
 class Source(StrEnum):
     TIENDA = "tienda"
     VOLAR = "volar"
+    ML = "ml"  # Mercado Libre: imported from saved pages (`volar import`), never synced
+
+
+SYNCABLE_SOURCES = (Source.TIENDA, Source.VOLAR)
 
 
 _SCHEMA = """
@@ -33,6 +37,8 @@ CREATE TABLE IF NOT EXISTS products (
     price_with_miles REAL,   -- tienda: cash left to pay when using `miles`
     in_stock INTEGER NOT NULL DEFAULT 1,
     badges TEXT,
+    seller TEXT,             -- ml only
+    condition TEXT,          -- ml only: Nuevo / Usado / Reacondicionado, when the page says
     first_seen TEXT NOT NULL,
     last_seen TEXT NOT NULL,
     PRIMARY KEY (source, id)
@@ -55,6 +61,10 @@ CREATE TABLE IF NOT EXISTS observations (
 );
 """
 
+# Columns added after the first release: `CREATE TABLE IF NOT EXISTS` skips existing
+# databases, so these get added with ALTER TABLE when missing.
+_ADDED_PRODUCT_COLUMNS = {"seller": "TEXT", "condition": "TEXT"}
+
 
 @dataclass(frozen=True, slots=True)
 class Product:
@@ -69,6 +79,8 @@ class Product:
     price_with_miles: float | None = None
     in_stock: bool = True
     badges: str | None = None
+    seller: str | None = None
+    condition: str | None = None
 
 
 def db_path() -> Path:
@@ -87,6 +99,10 @@ def connect(path: Path) -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.create_function("fold", 1, fold, deterministic=True)
     connection.executescript(_SCHEMA)
+    existing = {row["name"] for row in connection.execute("PRAGMA table_info(products)")}
+    for column, kind in _ADDED_PRODUCT_COLUMNS.items():
+        if column not in existing:
+            connection.execute(f"ALTER TABLE products ADD COLUMN {column} {kind}")
     return connection
 
 
@@ -111,14 +127,17 @@ def record_run(
             connection.execute(
                 """
                 INSERT INTO products (source, id, name, category, url, currency, price, miles,
-                                      price_with_miles, in_stock, badges, first_seen, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      price_with_miles, in_stock, badges, seller, condition,
+                                      first_seen, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (source, id) DO UPDATE SET
                     name = excluded.name,
                     category = COALESCE(excluded.category, products.category),
                     url = excluded.url, currency = excluded.currency, price = excluded.price,
                     miles = excluded.miles, price_with_miles = excluded.price_with_miles,
                     in_stock = excluded.in_stock, badges = excluded.badges,
+                    seller = excluded.seller,
+                    condition = COALESCE(excluded.condition, products.condition),
                     last_seen = excluded.last_seen
                 """,
                 (
@@ -133,6 +152,8 @@ def record_run(
                     p.price_with_miles,
                     p.in_stock,
                     p.badges,
+                    p.seller,
+                    p.condition,
                     now,
                     now,
                 ),
