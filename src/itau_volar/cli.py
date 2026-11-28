@@ -7,12 +7,24 @@ import sqlite3
 import sys
 import urllib.error
 from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime
 from http import HTTPStatus
+from pathlib import Path
 
 from logger import get_logger, init_logging
 
-from . import tienda, volar
-from .db import CHANGES_SQL, Product, Source, connect, db_path, fold, last_two_runs, record_run
+from . import ml, tienda, volar
+from .db import (
+    CHANGES_SQL,
+    SYNCABLE_SOURCES,
+    Product,
+    Source,
+    connect,
+    db_path,
+    fold,
+    last_two_runs,
+    record_run,
+)
 from .http import DEFAULT_DELAY_SECONDS, Client
 
 log = get_logger("volar")
@@ -28,9 +40,11 @@ _BLOCKED_HINT = (
 _BLOCKING_STATUSES = frozenset({HTTPStatus.FORBIDDEN, HTTPStatus.TOO_MANY_REQUESTS})
 
 _TABLE_COLUMNS = """source, id, name, currency AS cur, price, miles,
-    price_with_miles AS cash_left, CASE WHEN in_stock THEN '' ELSE 'out' END AS stock, badges"""
+    price_with_miles AS cash_left, CASE WHEN in_stock THEN '' ELSE 'out' END AS stock, badges,
+    seller"""
 _JSON_COLUMNS = (
-    "source, id, name, category, currency, price, miles, price_with_miles, in_stock, badges, url"
+    "source, id, name, category, currency, price, miles, price_with_miles, in_stock, badges, "
+    "seller, condition, url"
 )
 
 
@@ -62,7 +76,7 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(required=True, metavar="COMMAND")
 
     sync = commands.add_parser("sync", help="download a catalog into the local database")
-    sync.add_argument("source", choices=[*Source, "all"], nargs="?", default="all")
+    sync.add_argument("source", choices=[*SYNCABLE_SOURCES, "all"], nargs="?", default="all")
     sync.add_argument(
         "--category",
         type=int,
@@ -74,6 +88,13 @@ def _parser() -> argparse.ArgumentParser:
         "--delay", type=float, default=DEFAULT_DELAY_SECONDS, help="seconds between requests"
     )
     sync.set_defaults(run=_sync)
+
+    import_ = commands.add_parser(
+        "import", help="store Mercado Libre pages saved as text (e.g. by the Firefox MCP)"
+    )
+    import_.add_argument("source", choices=[Source.ML])
+    import_.add_argument("files", nargs="+", type=Path, help="page text files, one page each")
+    import_.set_defaults(run=_import)
 
     search = commands.add_parser("search", help="search the local database by name")
     search.add_argument("words", nargs="*", help="all words must appear in the name")
@@ -102,7 +123,7 @@ def _parser() -> argparse.ArgumentParser:
 def _sync(args: argparse.Namespace) -> int:
     client = Client(delay=args.delay)
     connection = connect(db_path())
-    sources = list(Source) if args.source == "all" else [Source(args.source)]
+    sources = list(SYNCABLE_SOURCES) if args.source == "all" else [Source(args.source)]
     for source in sources:
         if source is Source.TIENDA:
             scope = f"category:{args.category}"
@@ -149,6 +170,36 @@ def _volar_products(client: Client) -> list[Product]:
         )
         for item in volar.fetch_catalog(client.post_json)
     ]
+
+
+def _import(args: argparse.Namespace) -> int:
+    """Each file is one run, dated when the page was saved. Unreadable files are skipped."""
+    connection = connect(db_path())
+    failed = 0
+    for path in args.files:
+        try:
+            page = ml.parse_page(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ml.ParseError) as error:
+            log.error("%s: skipped: %s", path, error)
+            failed += 1
+            continue
+        products = [
+            Product(
+                source=Source.ML,
+                id=item.id,
+                name=item.title,
+                url=item.url,
+                currency=item.currency,
+                price=item.price,
+                seller=item.seller,
+                condition=item.condition,
+            )
+            for item in page.listings
+        ]
+        saved_at = datetime.fromtimestamp(path.stat().st_mtime, UTC)
+        record_run(connection, Source.ML, page.scope, products, at=saved_at)
+        log.info("%s: stored %d products (%s)", path.name, len(products), page.scope)
+    return _EXIT_ERROR if failed else 0
 
 
 def _search(args: argparse.Namespace) -> int:
